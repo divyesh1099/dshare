@@ -33,6 +33,7 @@ class ShareFlowsTests(TestCase):
 
     def test_user_upload_is_private(self):
         user = User.objects.create_user(username="u@example.com", email="u@example.com", password="pw")
+        UserProfile.objects.create(user=user, email_verified_at=timezone.now())
         self.client.force_login(user)
 
         res = self.client.post(reverse("upload"), {"text": "secret"})
@@ -385,3 +386,67 @@ class AuthFlowsTests(TestCase):
         res = self.client.get(reverse("auth_verify_email", kwargs={"token": token.token}))
         self.assertEqual(res.status_code, 302)
         self.assertFalse(UserProfile.objects.filter(user=user, email_verified_at__isnull=False).exists())
+
+
+class PrivateAccessTests(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(username="owner@example.com", password="pw")
+        self.other = User.objects.create_user(username="other@example.com", password="pw")
+        for user in (self.owner, self.other):
+            UserProfile.objects.create(user=user, email_verified_at=timezone.now())
+
+    def test_unverified_session_cannot_read_or_modify_private_data(self):
+        UserProfile.objects.filter(user=self.owner).update(email_verified_at=None)
+        UserShareState.objects.create(user=self.owner, text="secret")
+        self.client.force_login(self.owner)
+        for name in ("download", "api_share_text"):
+            response = self.client.get(reverse(name))
+            self.assertEqual(response.status_code, 403)
+            self.assertIn("no-store", response["Cache-Control"])
+        for name in ("upload", "api_share_clear", "api_upload_start", "api_upload_chunk", "api_upload_complete"):
+            self.assertEqual(self.client.post(reverse(name)).status_code, 403)
+        self.assertEqual(UserShareState.objects.get(user=self.owner).text, "secret")
+
+    def test_other_account_and_anonymous_cannot_read_owner_text(self):
+        UserShareState.objects.create(user=self.owner, text="secret")
+        self.client.force_login(self.other)
+        self.assertEqual(self.client.get(reverse("api_share_text")).json()["text"], "")
+        self.client.logout()
+        self.assertEqual(self.client.get(reverse("api_share_text")).json()["text"], "")
+
+    def test_private_file_streamed_without_storage_url_and_direct_media_denied(self):
+        with tempfile.TemporaryDirectory() as directory, override_settings(MEDIA_ROOT=directory):
+            share = UserShareState.objects.create(user=self.owner)
+            share.file.save("private.txt", SimpleUploadedFile("private.txt", b"private bytes"))
+            self.client.force_login(self.owner)
+            response = self.client.get(reverse("download"))
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn("Location", response)
+            self.assertIn("attachment", response["Content-Disposition"])
+            self.assertIn("no-store", response["Cache-Control"])
+            self.assertEqual(b"".join(response.streaming_content), b"private bytes")
+            response.close()
+            for client in (self.client, Client()):
+                self.assertEqual(client.get(share.file.url).status_code, 404)
+
+    def test_other_account_cannot_complete_private_upload(self):
+        from .models import UploadSession
+        session = UploadSession.objects.create(
+            user=self.owner, is_public=False, filename="secret.txt",
+            total_size=4, chunk_size=4, total_chunks=1,
+        )
+        for client in (self.client, Client()):
+            if client is self.client:
+                client.force_login(self.other)
+            response = client.post(
+                reverse("api_upload_complete"),
+                data=json.dumps({"upload_id": str(session.id)}),
+                content_type="application/json",
+            )
+            self.assertEqual(response.status_code, 403)
+        self.assertTrue(UploadSession.objects.filter(pk=session.pk).exists())
+
+    def test_passkey_authentication_requires_user_verification(self):
+        response = self.client.post(reverse("api_webauthn_auth_begin"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["publicKey"]["userVerification"], "required")

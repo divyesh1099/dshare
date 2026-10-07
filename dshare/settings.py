@@ -230,6 +230,10 @@ else:
 # Auth/session behavior
 # Keep sessions for 30 days (sliding) so verified users can just visit and type.
 SESSION_COOKIE_AGE = int(os.getenv("DSHARE_SESSION_COOKIE_AGE", str(60 * 60 * 24 * 30)))
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+SESSION_COOKIE_SAMESITE = "Lax"
 SESSION_SAVE_EVERY_REQUEST = True
 SESSION_EXPIRE_AT_BROWSER_CLOSE = False
 
