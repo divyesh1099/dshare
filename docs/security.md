@@ -29,3 +29,20 @@ This is convenient, but risky.
 Private mode isolates stored content per verified user, and sessions last ~30 days by default.
 
 Note: DShare is not end‑to‑end encrypted; the server can see files/text.
+
+## Private account access
+
+Private share reads, writes, clearing, and chunked uploads require an active,
+email-verified account. Account ownership checks also apply to upload sessions.
+Private responses use `Cache-Control: private, no-store, no-cache, max-age=0`.
+Passkeys require authenticator user verification (such as a device PIN or biometric).
+Production session and CSRF cookies require HTTPS; session cookies are HttpOnly.
+
+Files download as attachments through `/download/` rather than exposing storage
+URLs. Django does not serve `/media/` directly, including during development.
+Keep the object-storage bucket private and do not expose MEDIA_ROOT through a
+web server/CDN. Previously issued storage URLs remain usable until their expiry;
+this code change cannot revoke them. Downloads now stream through the application
+in bounded chunks, so large files consume application bandwidth and worker time
+without being buffered in full in worker memory.
+Anonymous public sharing is still available and is separate from private accounts.

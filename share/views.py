@@ -4,6 +4,7 @@ import math
 import os
 import shutil
 import tempfile
+from functools import wraps
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -17,10 +18,17 @@ from django.core.files.storage import default_storage
 from django.core.mail import EmailMultiAlternatives
 from django.core.validators import validate_email
 from django.contrib.auth.hashers import check_password, make_password
-from django.http import FileResponse, HttpRequest, HttpResponse, JsonResponse
+from django.http import (
+    FileResponse,
+    HttpRequest,
+    HttpResponse,
+    JsonResponse,
+    StreamingHttpResponse,
+)
 from django.shortcuts import redirect, render
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.cache import patch_cache_control
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST
 try:
@@ -56,6 +64,25 @@ from .models import (
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
+
+
+def _private_access(view):
+    """Keep anonymous public sharing, but fail closed for unverified accounts."""
+    @wraps(view)
+    def wrapped(request, *args, **kwargs):
+        if request.user.is_authenticated:
+            if not request.user.is_active or not UserProfile.objects.filter(
+                user=request.user, email_verified_at__isnull=False
+            ).exists():
+                response = JsonResponse({"status": "fail", "code": "verification_required"}, status=403)
+            else:
+                response = view(request, *args, **kwargs)
+            patch_cache_control(response, private=True, no_store=True, no_cache=True, max_age=0)
+            response["Pragma"] = "no-cache"
+            response["X-Content-Type-Options"] = "nosniff"
+            return response
+        return view(request, *args, **kwargs)
+    return wrapped
 
 
 def _parse_json(request: HttpRequest) -> dict:
@@ -511,13 +538,14 @@ def api_webauthn_register_begin(request: HttpRequest) -> JsonResponse:
         user_entity,
         credentials=existing,
         resident_key_requirement=ResidentKeyRequirement.PREFERRED,
-        user_verification=UserVerificationRequirement.PREFERRED,
+        user_verification=UserVerificationRequirement.REQUIRED,
     )
     request.session["webauthn_register_state"] = state
     return JsonResponse(dict(options))
 
 
 @require_POST
+@_private_access
 def api_webauthn_register_complete(request: HttpRequest) -> JsonResponse:
     if not _FIDO2_AVAILABLE:
         return JsonResponse({"status": "fail", "code": "webauthn_unavailable"}, status=503)
@@ -560,7 +588,7 @@ def api_webauthn_auth_begin(request: HttpRequest) -> JsonResponse:
 
     server = _get_fido_server(request)
     options, state = server.authenticate_begin(
-        user_verification=UserVerificationRequirement.PREFERRED
+        user_verification=UserVerificationRequirement.REQUIRED
     )
     request.session["webauthn_auth_state"] = state
     return JsonResponse(dict(options))
@@ -600,6 +628,11 @@ def api_webauthn_auth_complete(request: HttpRequest) -> JsonResponse:
     except Exception:
         return JsonResponse({"status": "fail"}, status=401)
 
+    if not UserProfile.objects.filter(
+        user=credential.user, email_verified_at__isnull=False
+    ).exists():
+        return JsonResponse({"status": "fail"}, status=403)
+
     login(
         request,
         credential.user,
@@ -625,6 +658,45 @@ def _delete_field_file(field_file) -> None:
         field_file.delete(save=False)
     except Exception as e:
         logger.error(f"Failed to delete file {field_file.name}: {e}")
+
+
+def _private_file_response(field_file) -> HttpResponse:
+    """Stream an authorized file without exposing its backing storage URL."""
+    storage = field_file.storage
+    filename = os.path.basename(field_file.name)
+
+    # S3File can spool the whole object before FileResponse sends it. Reading
+    # the SDK StreamingBody directly keeps worker memory use bounded.
+    if hasattr(storage, "bucket_name") and hasattr(storage, "connection"):
+        client = storage.connection.meta.client
+        result = client.get_object(Bucket=storage.bucket_name, Key=field_file.name)
+        body = result["Body"]
+
+        def chunks():
+            try:
+                while True:
+                    chunk = body.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                body.close()
+
+        response = StreamingHttpResponse(
+            chunks(),
+            content_type=result.get("ContentType") or "application/octet-stream",
+        )
+        if result.get("ContentLength") is not None:
+            response["Content-Length"] = str(result["ContentLength"])
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+    return FileResponse(
+        field_file.open("rb"),
+        as_attachment=True,
+        filename=filename,
+        content_type="application/octet-stream",
+    )
 
 
 def _get_or_create_user_share(user) -> UserShareState:
@@ -794,6 +866,7 @@ def _cleanup_expired_upload_sessions() -> None:
 
 
 @require_POST
+@_private_access
 def api_upload_start(request: HttpRequest) -> JsonResponse:
     data = _parse_json(request)
     filename = (data.get("filename") or "").strip()
@@ -899,6 +972,7 @@ def api_upload_start(request: HttpRequest) -> JsonResponse:
 
 
 @require_POST
+@_private_access
 def api_upload_chunk(request: HttpRequest) -> JsonResponse:
     upload_id = (request.POST.get("upload_id") or "").strip()
     index_raw = request.POST.get("index")
@@ -975,6 +1049,7 @@ def api_upload_chunk(request: HttpRequest) -> JsonResponse:
 
 
 @require_POST
+@_private_access
 def api_upload_complete(request: HttpRequest) -> JsonResponse:
     data = _parse_json(request)
     upload_id = (data.get("upload_id") or request.POST.get("upload_id") or "").strip()
@@ -1096,6 +1171,7 @@ def api_upload_complete(request: HttpRequest) -> JsonResponse:
 
 
 @require_POST
+@_private_access
 def upload_view(request: HttpRequest) -> JsonResponse:
     is_public = not request.user.is_authenticated
     if is_public:
@@ -1149,6 +1225,7 @@ def upload_view(request: HttpRequest) -> JsonResponse:
 
 
 @require_GET
+@_private_access
 def download_view(request: HttpRequest) -> HttpResponse:
     is_public = not request.user.is_authenticated
     ttl_seconds = int(
@@ -1162,7 +1239,8 @@ def download_view(request: HttpRequest) -> HttpResponse:
     _maybe_expire_share(share=share, ttl_seconds=ttl_seconds)
 
     if share.file:
-        return redirect(share.file.url)
+        # Never expose a reusable storage URL for private content.
+        return _private_file_response(share.file)
 
     if share.text:
         return HttpResponse(share.text, content_type="text/plain")
@@ -1171,6 +1249,7 @@ def download_view(request: HttpRequest) -> HttpResponse:
 
 
 @require_GET
+@_private_access
 def api_share_text(request: HttpRequest) -> JsonResponse:
     is_public = not request.user.is_authenticated
     ttl_seconds = int(
@@ -1186,6 +1265,7 @@ def api_share_text(request: HttpRequest) -> JsonResponse:
 
 
 @require_POST
+@_private_access
 def api_share_clear(request: HttpRequest) -> JsonResponse:
     is_public = not request.user.is_authenticated
     if is_public:

@@ -62,4 +62,4 @@ urlpatterns = [
     ),
     path("api/share/text/", api_share_text, name="api_share_text"),
     path("api/share/clear/", api_share_clear, name="api_share_clear"),
-] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+]
