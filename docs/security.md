@@ -42,6 +42,7 @@ Files download as attachments through `/download/` rather than exposing storage
 URLs. Django does not serve `/media/` directly, including during development.
 Keep the object-storage bucket private and do not expose MEDIA_ROOT through a
 web server/CDN. Previously issued storage URLs remain usable until their expiry;
-this code change cannot revoke them. Downloads now pass through the application,
-so large files consume application bandwidth and storage-backend resources.
+this code change cannot revoke them. Downloads now stream through the application
+in bounded chunks, so large files consume application bandwidth and worker time
+without being buffered in full in worker memory.
 Anonymous public sharing is still available and is separate from private accounts.

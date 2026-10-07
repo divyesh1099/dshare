@@ -18,7 +18,13 @@ from django.core.files.storage import default_storage
 from django.core.mail import EmailMultiAlternatives
 from django.core.validators import validate_email
 from django.contrib.auth.hashers import check_password, make_password
-from django.http import FileResponse, HttpRequest, HttpResponse, JsonResponse
+from django.http import (
+    FileResponse,
+    HttpRequest,
+    HttpResponse,
+    JsonResponse,
+    StreamingHttpResponse,
+)
 from django.shortcuts import redirect, render
 from django.urls import reverse
 from django.utils import timezone
@@ -654,6 +660,45 @@ def _delete_field_file(field_file) -> None:
         logger.error(f"Failed to delete file {field_file.name}: {e}")
 
 
+def _private_file_response(field_file) -> HttpResponse:
+    """Stream an authorized file without exposing its backing storage URL."""
+    storage = field_file.storage
+    filename = os.path.basename(field_file.name)
+
+    # S3File can spool the whole object before FileResponse sends it. Reading
+    # the SDK StreamingBody directly keeps worker memory use bounded.
+    if hasattr(storage, "bucket_name") and hasattr(storage, "connection"):
+        client = storage.connection.meta.client
+        result = client.get_object(Bucket=storage.bucket_name, Key=field_file.name)
+        body = result["Body"]
+
+        def chunks():
+            try:
+                while True:
+                    chunk = body.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                body.close()
+
+        response = StreamingHttpResponse(
+            chunks(),
+            content_type=result.get("ContentType") or "application/octet-stream",
+        )
+        if result.get("ContentLength") is not None:
+            response["Content-Length"] = str(result["ContentLength"])
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+    return FileResponse(
+        field_file.open("rb"),
+        as_attachment=True,
+        filename=filename,
+        content_type="application/octet-stream",
+    )
+
+
 def _get_or_create_user_share(user) -> UserShareState:
     share, _ = UserShareState.objects.get_or_create(user=user)
     return share
@@ -1195,11 +1240,7 @@ def download_view(request: HttpRequest) -> HttpResponse:
 
     if share.file:
         # Never expose a reusable storage URL for private content.
-        return FileResponse(
-            share.file.open("rb"), as_attachment=True,
-            filename=os.path.basename(share.file.name),
-            content_type="application/octet-stream",
-        )
+        return _private_file_response(share.file)
 
     if share.text:
         return HttpResponse(share.text, content_type="text/plain")

@@ -1,5 +1,6 @@
 import json
 import tempfile
+from unittest.mock import MagicMock
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import check_password
@@ -450,3 +451,30 @@ class PrivateAccessTests(TestCase):
         response = self.client.post(reverse("api_webauthn_auth_begin"))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["publicKey"]["userVerification"], "required")
+
+    def test_object_storage_download_streams_in_bounded_reads(self):
+        from .views import _private_file_response
+
+        body = MagicMock()
+        body.read.side_effect = [b"first", b"second", b""]
+        client = MagicMock()
+        client.get_object.return_value = {
+            "Body": body,
+            "ContentLength": 11,
+            "ContentType": "text/plain",
+        }
+        storage = MagicMock()
+        storage.bucket_name = "private-bucket"
+        storage.connection.meta.client = client
+        field_file = MagicMock()
+        field_file.storage = storage
+        field_file.name = "uploads/user/private.txt"
+
+        response = _private_file_response(field_file)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Length"], "11")
+        self.assertEqual(b"".join(response.streaming_content), b"firstsecond")
+        self.assertEqual(body.read.call_count, 3)
+        body.read.assert_called_with(1024 * 1024)
+        body.close.assert_called_once()
+        field_file.open.assert_not_called()
