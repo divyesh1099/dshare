@@ -278,3 +278,18 @@ DSHARE_PUBLIC_UPLOAD_LIMIT = int(os.getenv("DSHARE_PUBLIC_UPLOAD_LIMIT", "100"))
 DSHARE_PUBLIC_CLEAR_LIMIT = int(os.getenv("DSHARE_PUBLIC_CLEAR_LIMIT", "100"))
 DSHARE_RP_NAME = os.getenv("DSHARE_RP_NAME", "DShare")
 DSHARE_RP_ID = os.getenv("DSHARE_RP_ID", "")
+
+# Keep production exceptions visible in platform logs while returning generic
+# error pages to clients.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {
+        "django.request": {
+            "handlers": ["console"],
+            "level": "ERROR",
+            "propagate": False,
+        },
+    },
+}
