@@ -388,8 +388,9 @@
           try {
             return await action();
           } catch (_) {
-            if (attempt === attempts - 1) throw _;
+            if (!_.isBusy && attempt === attempts - 1) throw _;
             await new Promise((resolve) => setTimeout(resolve, Math.max(delayMs, _.retryAfter || 0)));
+            if (_.isBusy) attempt--; // Queue congestion must not discard a resumable upload.
             delayMs = Math.min(delayMs * 2, 10000);
           }
         }
@@ -1110,6 +1111,7 @@
           if (!res.ok) {
             const error = new Error("chunk upload failed");
             error.retryAfter = Number(res.headers.get("Retry-After") || 0) * 1000;
+            error.isBusy = res.status === 429;
             throw error;
           }
           return chunk.size;
@@ -1144,7 +1146,10 @@
             upload_id: session.upload_id,
           });
           if (response.status >= 500 || response.status === 429) {
-            throw new Error("Storage temporarily unavailable; retrying completion");
+            const error = new Error("Storage temporarily unavailable; retrying completion");
+            error.isBusy = response.status === 429;
+            error.retryAfter = Number(response.headers.get("Retry-After") || 0) * 1000;
+            throw error;
           }
           return response;
         }
