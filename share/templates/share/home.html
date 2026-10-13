@@ -1136,11 +1136,17 @@
 
         await Promise.all(Array.from({ length: concurrency }, worker));
 
-        let complete = await retry(() =>
-          postJSON("/api/upload/complete/", {
+        uploadProgressLabel.textContent = "Saving file…";
+        async function completeUpload() {
+          const response = await postJSON("/api/upload/complete/", {
             upload_id: session.upload_id,
-          })
-        );
+          });
+          if (response.status >= 500 || response.status === 429) {
+            throw new Error("Storage temporarily unavailable; retrying completion");
+          }
+          return response;
+        }
+        let complete = await retry(completeUpload);
         let completeData = await safeJson(complete);
         if (
           !complete.ok &&
@@ -1166,11 +1172,7 @@
               reuploadWorker
             )
           );
-          complete = await retry(() =>
-            postJSON("/api/upload/complete/", {
-              upload_id: session.upload_id,
-            })
-          );
+          complete = await retry(completeUpload);
           completeData = await safeJson(complete);
         }
         if (!complete.ok || !completeData || completeData.status !== "ok") {
@@ -1242,12 +1244,8 @@
           return true;
         } catch (err) {
           console.error(err);
-          toast("fallback", 1200);
-          uploadCanPause = false;
-          updateUploadToggle();
-          setUploadProgress(0);
-          await retry(() => uploadDirectFile(file), 2, 700);
-          return true;
+          toast("Upload interrupted. Select the same file to resume.", 5000);
+          throw err;
         }
       }
 

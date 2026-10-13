@@ -90,5 +90,6 @@ class UploadSession(models.Model):
     chunk_size = models.PositiveIntegerField()
     total_chunks = models.PositiveIntegerField()
     received_chunks = models.JSONField(default=list, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

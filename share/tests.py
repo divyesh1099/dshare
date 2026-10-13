@@ -474,7 +474,82 @@ class PrivateAccessTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response["Content-Length"], "11")
         self.assertEqual(b"".join(response.streaming_content), b"firstsecond")
-        self.assertEqual(body.read.call_count, 3)
-        body.read.assert_called_with(1024 * 1024)
+        self.assertEqual(body.read.call_count, 2)
+        self.assertTrue(all(call.args[0] <= 1024 * 1024 for call in body.read.call_args_list))
         body.close.assert_called_once()
         field_file.open.assert_not_called()
+
+
+class LargeTransferTests(ChunkedUploadTests):
+    def test_700_mib_roundtrip_public_and_private(self):
+        import hashlib
+        from .models import UploadSession
+
+        user = User.objects.create_user(username="large", password="pw")
+        UserProfile.objects.create(user=user, email_verified_at=timezone.now())
+        total = 700 * 1024 * 1024
+        chunk_size = 8 * 1024 * 1024
+        storage_settings = self._storage_settings()
+        storage_settings["DSHARE_UPLOAD_MAX_CHUNK_BYTES"] = chunk_size
+        with override_settings(**storage_settings):
+            for private in (False, True):
+                if private:
+                    self.client.force_login(user)
+                start = self.client.post(reverse("api_upload_start"),
+                    data=json.dumps({"filename": "large.bin", "size": total, "chunk_size": chunk_size}),
+                    content_type="application/json")
+                self.assertEqual(start.status_code, 200)
+                session_id = start.json()["upload_id"]
+                digest = hashlib.sha256()
+                for index in range(start.json()["total_chunks"]):
+                    # Different bytes in each chunk detect offset/assembly errors.
+                    part = bytes([index % 256]) * min(chunk_size, total - index * chunk_size)
+                    digest.update(part)
+                    response = self.client.post(reverse("api_upload_chunk"), {
+                        "upload_id": session_id, "index": index,
+                        "chunk": SimpleUploadedFile("large.bin", part)})
+                    self.assertEqual(response.status_code, 200)
+                payload = json.dumps({"upload_id": session_id})
+                for _ in range(2):  # Lost completion response can safely be retried.
+                    response = self.client.post(reverse("api_upload_complete"), data=payload, content_type="application/json")
+                    self.assertEqual(response.status_code, 200)
+                self.assertIsNotNone(UploadSession.objects.get(id=session_id).completed_at)
+                response = self.client.get(reverse("download"))
+                actual = hashlib.sha256()
+                size = 0
+                for block in response.streaming_content:
+                    self.assertLessEqual(len(block), 1024 * 1024)
+                    actual.update(block)
+                    size += len(block)
+                response.close()
+                self.assertEqual(size, total)
+                self.assertEqual(actual.digest(), digest.digest())
+                resumed = self.client.get(reverse("download"), HTTP_RANGE=f"bytes={total-1024}-")
+                self.assertEqual(resumed.status_code, 206)
+                self.assertEqual(len(b"".join(resumed.streaming_content)), 1024)
+                resumed.close()
+                head = self.client.head(reverse("download"))
+                self.assertEqual(head.status_code, 200)
+                self.assertEqual(int(head["Content-Length"]), total)
+                invalid = self.client.get(reverse("download"), HTTP_RANGE=f"bytes={total}-")
+                self.assertEqual(invalid.status_code, 416)
+                share = UserShareState.objects.get(user=user) if private else PublicShareState.objects.get(pk=1)
+                share.file.delete()
+
+    def test_s3_range_forwarded_without_buffering(self):
+        from django.test import RequestFactory
+        from .views import _private_file_response
+        body = MagicMock()
+        body.read.return_value = b"tail"
+        field = MagicMock()
+        field.name = "uploads/user/example.bin"
+        field.size = 700 * 1024 * 1024
+        field.storage.bucket_name = "private"
+        client = field.storage.connection.meta.client
+        client.get_object.return_value = {"Body": body, "ContentLength": 4}
+        response = _private_file_response(field, RequestFactory().get("/download/", HTTP_RANGE="bytes=-4"))
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(b"".join(response.streaming_content), b"tail")
+        client.get_object.assert_called_once_with(Bucket="private", Key=field.name,
+            Range=f"bytes={field.size-4}-{field.size-1}")
+        field.open.assert_not_called()

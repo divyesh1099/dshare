@@ -46,3 +46,17 @@ this code change cannot revoke them. Downloads now stream through the applicatio
 in bounded chunks, so large files consume application bandwidth and worker time
 without being buffered in full in worker memory.
 Anonymous public sharing is still available and is separate from private accounts.
+
+## Large transfers
+
+Run Gunicorn with `gunicorn.conf.py` (also discovered automatically from the
+repository root). Threaded workers keep heartbeating during long transfers;
+Railway's start command must not select synchronous workers. Public and private
+downloads support HEAD and single byte ranges for resume, stream at most 1 MiB
+per read, and still authorize every request without exposing storage URLs.
+Large web uploads use 8 MiB resumable chunks and never fall back to a whole-file
+POST. Completion retries retain a receipt for the upload-session TTL; concurrent
+completion requests are serialized across workers. Replacement files get unique
+keys and the previous file is deleted only after the new file is saved.
+Chunk sessions currently use local disk: keep one service replica. A restart or
+deployment can discard unfinished chunks; select the file again to restart.

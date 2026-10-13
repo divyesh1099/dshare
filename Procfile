@@ -1,1 +1,1 @@
-web: gunicorn dshare.wsgi --log-file - --timeout 600 --workers 2 --threads 4
+web: gunicorn dshare.wsgi --config gunicorn.conf.py --log-file -

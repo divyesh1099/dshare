@@ -1,3 +1,5 @@
+import fcntl
+import uuid
 import json
 import logging
 import math
@@ -12,6 +14,7 @@ from urllib.request import Request, urlopen
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model, login, logout
 from django.core.cache import cache
+from django.db import transaction
 from django.core.exceptions import ValidationError
 from django.core.files import File
 from django.core.files.storage import default_storage
@@ -28,9 +31,10 @@ from django.http import (
 from django.shortcuts import redirect, render
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.http import content_disposition_header
 from django.utils.cache import patch_cache_control
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
-from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.http import require_GET, require_POST, require_http_methods
 try:
     from fido2.server import Fido2Server
     from fido2.utils import websafe_decode
@@ -660,43 +664,93 @@ def _delete_field_file(field_file) -> None:
         logger.error(f"Failed to delete file {field_file.name}: {e}")
 
 
-def _private_file_response(field_file) -> HttpResponse:
-    """Stream an authorized file without exposing its backing storage URL."""
+def _download_range(header, size):
+    """Single byte range, including open-ended and suffix resume requests."""
+    if not header or not header.startswith("bytes="):
+        return None
+    try:
+        first, last = header[6:].split("-", 1)
+        if not first:
+            suffix = int(last)
+            if suffix <= 0 or size == 0:
+                raise ValueError
+            return max(0, size - suffix), size - 1
+        start = int(first)
+        end = min(int(last), size - 1) if last else size - 1
+        if start < 0 or start >= size or end < start:
+            raise ValueError
+        return start, end
+    except (ValueError, TypeError):
+        raise ValueError("Invalid or unsatisfiable byte range")
+
+
+def _private_file_response(field_file, request=None) -> HttpResponse:
+    """Bounded, resumable streaming; storage URLs never leave the server."""
     storage = field_file.storage
     filename = os.path.basename(field_file.name)
+    is_s3 = hasattr(storage, "bucket_name") and hasattr(storage, "connection")
+    header = request.headers.get("Range") if request else None
+    head = request is not None and request.method == "HEAD"
+    # If-Range without a validator we can verify must return the complete file.
+    if request and request.headers.get("If-Range"):
+        header = None
+    size = None
+    byte_range = None
+    if header or head:
+        size = field_file.size
+        try:
+            byte_range = _download_range(header, size)
+        except ValueError:
+            response = HttpResponse(status=416)
+            response["Content-Range"] = f"bytes */{size}"
+            response["Accept-Ranges"] = "bytes"
+            return response
 
-    # S3File can spool the whole object before FileResponse sends it. Reading
-    # the SDK StreamingBody directly keeps worker memory use bounded.
-    if hasattr(storage, "bucket_name") and hasattr(storage, "connection"):
+    content_type = "application/octet-stream"
+    body = None
+    if is_s3 and not head:
         client = storage.connection.meta.client
-        result = client.get_object(Bucket=storage.bucket_name, Key=field_file.name)
+        params = {"Bucket": storage.bucket_name, "Key": field_file.name}
+        if byte_range:
+            params["Range"] = f"bytes={byte_range[0]}-{byte_range[1]}"
+        result = client.get_object(**params)
         body = result["Body"]
+        size = result.get("ContentLength")
+        content_type = result.get("ContentType") or content_type
+    elif not head:
+        body = field_file.open("rb")
+        size = field_file.size
+        if byte_range:
+            body.seek(byte_range[0])
 
+    length = byte_range[1] - byte_range[0] + 1 if byte_range else size
+    if head:
+        response = HttpResponse(content_type=content_type)
+    else:
         def chunks():
+            remaining = length
             try:
-                while True:
-                    chunk = body.read(1024 * 1024)
-                    if not chunk:
+                while remaining is None or remaining > 0:
+                    data = body.read(min(1024 * 1024, remaining) if remaining is not None else 1024 * 1024)
+                    if not data:
                         break
-                    yield chunk
+                    yield data
+                    if remaining is not None:
+                        remaining -= len(data)
             finally:
                 body.close()
 
-        response = StreamingHttpResponse(
-            chunks(),
-            content_type=result.get("ContentType") or "application/octet-stream",
-        )
-        if result.get("ContentLength") is not None:
-            response["Content-Length"] = str(result["ContentLength"])
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
-        return response
-
-    return FileResponse(
-        field_file.open("rb"),
-        as_attachment=True,
-        filename=filename,
-        content_type="application/octet-stream",
-    )
+        response = StreamingHttpResponse(chunks(), content_type=content_type)
+        # Close upstream even if the browser disconnects before first iteration.
+        response._resource_closers.append(body.close)
+    response["Content-Disposition"] = content_disposition_header(True, filename)
+    response["Accept-Ranges"] = "bytes"
+    if length is not None:
+        response["Content-Length"] = str(length)
+    if byte_range:
+        response.status_code = 206
+        response["Content-Range"] = f"bytes {byte_range[0]}-{byte_range[1]}/{field_file.size}"
+    return response
 
 
 def _get_or_create_user_share(user) -> UserShareState:
@@ -862,6 +916,10 @@ def _cleanup_expired_upload_sessions() -> None:
     expired = UploadSession.objects.filter(updated_at__lt=cutoff)
     for session in expired:
         _delete_upload_session_files(session)
+        try:
+            os.remove(os.path.join(_upload_chunk_root(), str(session.id) + ".lock"))
+        except FileNotFoundError:
+            pass
     expired.delete()
 
 
@@ -914,6 +972,8 @@ def api_upload_start(request: HttpRequest) -> JsonResponse:
             session = None
         if session:
             if session.is_public != is_public or session.user_id != (user.id if user else None):
+                session = None
+            elif session.completed_at:
                 session = None
             elif (
                 session.filename != filename
@@ -998,6 +1058,9 @@ def api_upload_chunk(request: HttpRequest) -> JsonResponse:
     if session.user_id and not request.user.is_authenticated:
         return JsonResponse({"status": "fail"}, status=403)
 
+    if session.completed_at:
+        return JsonResponse({"status": "fail"}, status=409)
+
     if index < 0 or index >= session.total_chunks:
         return JsonResponse({"status": "fail"}, status=400)
 
@@ -1048,8 +1111,28 @@ def api_upload_chunk(request: HttpRequest) -> JsonResponse:
     return JsonResponse({"status": "ok"})
 
 
+def _serialize_upload_completion(view):
+    @wraps(view)
+    def wrapped(request):
+        data = _parse_json(request)
+        raw_id = data.get("upload_id") or request.POST.get("upload_id") or ""
+        try:
+            session_id = str(uuid.UUID(raw_id))
+        except (ValueError, TypeError, AttributeError):
+            return JsonResponse({"status": "fail"}, status=400)
+        if not UploadSession.objects.filter(id=session_id).exists():
+            return JsonResponse({"status": "fail"}, status=404)
+        os.makedirs(_upload_chunk_root(), exist_ok=True)
+        lock_path = os.path.join(_upload_chunk_root(), session_id + ".lock")
+        with open(lock_path, "a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return view(request)
+    return wrapped
+
+
 @require_POST
 @_private_access
+@_serialize_upload_completion
 def api_upload_complete(request: HttpRequest) -> JsonResponse:
     data = _parse_json(request)
     upload_id = (data.get("upload_id") or request.POST.get("upload_id") or "").strip()
@@ -1069,6 +1152,9 @@ def api_upload_complete(request: HttpRequest) -> JsonResponse:
             return JsonResponse({"status": "fail"}, status=403)
     if session.user_id and not request.user.is_authenticated:
         return JsonResponse({"status": "fail"}, status=403)
+
+    if session.completed_at:
+        return JsonResponse({"status": "ok"})
 
     session_id = str(session.id)
     session_dir = _upload_session_dir(session_id)
@@ -1135,13 +1221,13 @@ def api_upload_complete(request: HttpRequest) -> JsonResponse:
         )
         _maybe_expire_share(share=share, ttl_seconds=ttl_seconds)
 
-        if share.file:
-            _delete_field_file(share.file)
+        old_file_name = share.file.name if share.file else None
 
         stored = False
         try:
             storage = share.file.storage
-            final_name = share.file.field.generate_filename(share, session.filename)
+            replacement_name = f"{session.id}/{os.path.basename(session.filename)}"
+            final_name = share.file.field.generate_filename(share, replacement_name)
             final_path = storage.path(final_name)
             os.makedirs(os.path.dirname(final_path), exist_ok=True)
             os.replace(assembled_path, final_path)
@@ -1153,10 +1239,18 @@ def api_upload_complete(request: HttpRequest) -> JsonResponse:
         if not stored:
             with open(assembled_path, "rb") as handle:
                 django_file = File(handle, name=session.filename)
-                share.file.save(session.filename, django_file, save=False)
+                share.file.save(f"{session.id}/{os.path.basename(session.filename)}", django_file, save=False)
         share.text = None
-        share.save(update_fields=["file", "text", "updated_at"])
+        with transaction.atomic():
+            share.save(update_fields=["file", "text", "updated_at"])
+            session.completed_at = timezone.now()
+            session.save(update_fields=["completed_at", "updated_at"])
         completed = True
+        if old_file_name and old_file_name != share.file.name:
+            try:
+                share.file.storage.delete(old_file_name)
+            except Exception:
+                logger.exception("Failed to remove replaced file")
     finally:
         if not completed and assembled_temp and os.path.exists(assembled_temp):
             try:
@@ -1165,7 +1259,7 @@ def api_upload_complete(request: HttpRequest) -> JsonResponse:
                 logger.exception("Failed to remove assembled temp upload file")
         if completed:
             _delete_upload_session_files(session)
-            session.delete()
+            # Retain the completion receipt so a lost response can be retried.
 
     return JsonResponse({"status": "ok"})
 
@@ -1224,7 +1318,7 @@ def upload_view(request: HttpRequest) -> JsonResponse:
     return JsonResponse({"status": "fail"}, status=400)
 
 
-@require_GET
+@require_http_methods(["GET", "HEAD"])
 @_private_access
 def download_view(request: HttpRequest) -> HttpResponse:
     is_public = not request.user.is_authenticated
@@ -1240,7 +1334,7 @@ def download_view(request: HttpRequest) -> HttpResponse:
 
     if share.file:
         # Never expose a reusable storage URL for private content.
-        return _private_file_response(share.file)
+        return _private_file_response(share.file, request)
 
     if share.text:
         return HttpResponse(share.text, content_type="text/plain")
