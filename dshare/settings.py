@@ -13,7 +13,6 @@ https://docs.djangoproject.com/en/5.0/ref/settings/
 import os
 from pathlib import Path
 import dj_database_url
-from botocore.config import Config
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -207,9 +206,6 @@ if AWS_ACCESS_KEY_ID:
                 "signature_version": AWS_S3_SIGNATURE_VERSION,
                 "querystring_auth": True,
                 "addressing_style": "path",
-                "client_config": Config(signature_version="s3v4", s3={"addressing_style": "path"},
-                    max_pool_connections=32, connect_timeout=10,
-                    read_timeout=90, retries={"max_attempts": 4, "mode": "standard"}),
             },
         },
         "staticfiles": {

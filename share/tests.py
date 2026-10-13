@@ -743,3 +743,13 @@ class MultipartTransferTests(TestCase):
         first_body.read.assert_not_called()
         field.open.assert_not_called()
         self.assertEqual(self.sdk.get_object.call_count, 17)
+
+
+class ProductionStorageConfigTests(TestCase):
+    def test_exact_production_options_initialize_installed_storage_backend(self):
+        import os, subprocess, sys
+        env = dict(os.environ, AWS_ACCESS_KEY_ID="test-key", AWS_SECRET_ACCESS_KEY="test-secret",
+            AWS_STORAGE_BUCKET_NAME="test-bucket", AWS_S3_ENDPOINT_URL="https://example.invalid",
+            DJANGO_SETTINGS_MODULE="dshare.settings")
+        result = subprocess.run([sys.executable, "-c", "import django; django.setup(); from django.core.files.storage import default_storage; from storages.backends.s3 import S3Storage; assert isinstance(default_storage, S3Storage); assert default_storage.bucket_name == 'test-bucket'; assert default_storage.config.s3['addressing_style'] == 'path'"], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
