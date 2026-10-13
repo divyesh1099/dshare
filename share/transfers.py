@@ -83,6 +83,9 @@ def begin_multipart(session, share):
 
 
 def store_multipart_chunk(session, index, uploaded_file):
+    # A lost HTTP response must not overwrite an already confirmed R2 part.
+    if str(index) in session.part_etags:
+        return
     storage = multipart_storage()
     uploaded_file.seek(0)
     result = storage.connection.meta.client.upload_part(
@@ -101,6 +104,38 @@ def store_multipart_chunk(session, index, uploaded_file):
         current.save(update_fields=["part_etags", "updated_at"])
 
 
+def reconcile_multipart_receipts(session, storage):
+    """Recover actual storage state after an interrupted/retried part upload."""
+    client = storage.connection.meta.client
+    params = {"Bucket": storage.bucket_name, "Key": object_key(storage, session.storage_key),
+        "UploadId": session.storage_upload_id}
+    actual = {}
+    while True:
+        page = client.list_parts(**params)
+        for part in page.get("Parts", []):
+            index = part["PartNumber"] - 1
+            expected = min(session.chunk_size, session.total_size - index * session.chunk_size)
+            if 0 <= index < session.total_chunks and part["Size"] == expected:
+                actual[str(index)] = part["ETag"]
+        if not page.get("IsTruncated"):
+            break
+        params["PartNumberMarker"] = page["NextPartNumberMarker"]
+    with transaction.atomic():
+        current = UploadSession.objects.select_for_update().get(id=session.id)
+        receipts = dict(current.part_etags)
+        for index, etag in session.part_etags.items():
+            if receipts.get(index) == etag:
+                if index in actual:
+                    receipts[index] = actual[index]
+                else:
+                    receipts.pop(index, None)
+        for index, etag in actual.items():
+            receipts.setdefault(index, etag)
+        current.part_etags = receipts
+        current.save(update_fields=["part_etags", "updated_at"])
+        session.part_etags = receipts
+
+
 def finish_multipart(session, share):
     storage = multipart_storage()
     missing = [i for i in range(session.total_chunks) if str(i) not in session.part_etags]
@@ -114,6 +149,10 @@ def finish_multipart(session, share):
             MultipartUpload={"Parts": [{"PartNumber": i + 1, "ETag": session.part_etags[str(i)]} for i in range(session.total_chunks)]},
         )
     except ClientError as exc:
+        if exc.response["Error"]["Code"] in ("InvalidPart", "InvalidPartOrder"):
+            reconcile_multipart_receipts(session, storage)
+            missing = [i for i in range(session.total_chunks) if str(i) not in session.part_etags]
+            return JsonResponse({"status": "fail", "missing_chunks": missing}, status=409) if missing else JsonResponse({"status": "fail", "code": "retry_completion"}, status=503)
         if exc.response["Error"]["Code"] != "NoSuchUpload":
             raise
         # Recover if storage committed successfully before a response/DB failure.

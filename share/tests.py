@@ -744,6 +744,32 @@ class MultipartTransferTests(TestCase):
         field.open.assert_not_called()
         self.assertEqual(self.sdk.get_object.call_count, 17)
 
+    def test_confirmed_part_retry_does_not_overwrite_storage(self):
+        from .models import UploadSession
+        from .transfers import store_multipart_chunk
+        session = UploadSession.objects.create(filename='file.bin', total_size=7,
+            chunk_size=8*1024*1024, total_chunks=1, storage_upload_id='id',
+            storage_key='unique/file.bin', part_etags={'0': 'confirmed'})
+        store_multipart_chunk(session, 0, SimpleUploadedFile('file.bin', b'content'))
+        self.sdk.upload_part.assert_not_called()
+
+    def test_lost_storage_part_is_reported_for_reupload(self):
+        from botocore.exceptions import ClientError
+        from .models import UploadSession
+        from .transfers import finish_multipart
+        session = UploadSession.objects.create(user=self.user, is_public=False,
+            filename='file.bin', total_size=7, chunk_size=8*1024*1024, total_chunks=1,
+            storage_upload_id='id', storage_key='unique/file.bin', part_etags={'0': 'lost'})
+        self.sdk.complete_multipart_upload.side_effect = ClientError({'Error': {'Code': 'InvalidPart'}}, 'CompleteMultipartUpload')
+        self.sdk.list_parts.return_value = {'Parts': [], 'IsTruncated': False}
+        share = UserShareState.objects.create(user=self.user)
+        response = finish_multipart(session, share)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(json.loads(response.content)['missing_chunks'], [0])
+        session.refresh_from_db()
+        self.assertEqual(session.part_etags, {})
+        self.assertFalse(share.file)
+
 
 class ProductionStorageConfigTests(TestCase):
     def test_exact_production_options_initialize_installed_storage_backend(self):
