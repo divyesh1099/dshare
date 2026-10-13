@@ -1,19 +1,80 @@
-<!DOCTYPE html>
-<html class="dark">
-<head>
-    <title>Download</title>
-    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-</head>
-<body class="bg-black text-white font-sans">
-    <div class="min-h-screen flex items-center justify-center">
-        <div>
-            {% if file %}
-                <a href="{{ file.url }}" class="p-2 bg-white text-black">Download File</a>
-            {% endif %}
-            {% if text %}
-                <div class="p-2 bg-white text-black">{{ text }}</div>
-            {% endif %}
-        </div>
-    </div>
-</body>
-</html>
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Download · dshare</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#090909;color:#f4f4f5;font:16px system-ui,sans-serif;min-height:100vh;display:grid;place-items:center;padding:24px}.card{width:min(560px,100%);padding:32px;border:1px solid #292929;border-radius:20px;background:#111}h1{font-size:26px;margin:8px 0 20px;overflow-wrap:anywhere}.muted{color:#a1a1aa;font-size:14px}.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}button{border:0;border-radius:10px;padding:13px 20px;background:#f4f4f5;color:#111;font:600 15px system-ui;cursor:pointer}button:disabled{opacity:.5;cursor:wait}#pause{background:#282828;color:#fff}progress{width:100%;height:12px;accent-color:#fff;margin:20px 0 8px}#status{min-height:48px;line-height:1.5}a{color:#a1a1aa;text-underline-offset:4px}.badge{font-size:12px;border:1px solid #333;border-radius:20px;padding:5px 10px}.footer{margin-top:28px}.hidden{display:none}
+</style></head><body><main class="card">
+<div class="row"><span class="muted">dshare</span><span class="badge" id="mode"></span></div>
+<h1 id="filename"></h1><p class="muted" id="size"></p>
+<p id="status" role="status" aria-live="polite">Choose where to save your file. Keep this tab open while it downloads.</p>
+<div class="row"><button id="start">Save file</button><button id="pause" class="hidden">Pause</button></div>
+<progress id="progress" value="0" max="100" aria-label="Download progress"></progress><p class="muted" id="detail">0%</p>
+<p class="muted hidden" id="fallback">Save-to-disk downloads require Chrome or Edge on desktop. You can also use your browser's download manager and resume interrupted downloads.</p>
+<div class="footer row"><a href="/">Back to dshare</a><a href="/download/?raw=1">Use browser download</a></div>
+{{ transfer|json_script:"transfer-data" }}
+<script>
+const meta=JSON.parse(document.getElementById('transfer-data').textContent);
+const start=document.getElementById('start'),pause=document.getElementById('pause'),status=document.getElementById('status'),progress=document.getElementById('progress'),detail=document.getElementById('detail');
+document.getElementById('filename').textContent=meta.filename;
+document.getElementById('mode').textContent=meta.mode;
+document.getElementById('size').textContent=(meta.size/(1024**3)).toFixed(2)+' GiB';
+const PART=4*1024*1024;
+let handle=null,offset=0,running=false,controller=null,paused=false;
+function failure(message,fatal=false){const error=new Error(message);error.fatal=fatal;return error;}
+function delay(ms,signal){return new Promise((resolve,reject)=>{const abort=()=>{clearTimeout(timer);reject(new DOMException('Paused','AbortError'));};const timer=setTimeout(()=>{signal.removeEventListener('abort',abort);resolve();},ms);signal.addEventListener('abort',abort,{once:true});if(signal.aborted)abort();});}
+async function fetchPart(first,last,signal){
+  for(let attempt=0;;attempt++){
+    if(signal.aborted)throw new DOMException('Paused','AbortError');
+    const partController=new AbortController();const stop=()=>partController.abort();signal.addEventListener('abort',stop,{once:true});const timer=setTimeout(stop,120000);
+    let wait=1000*Math.min(8,2**attempt);
+    try{
+      const res=await fetch('/download/?raw=1&version='+encodeURIComponent(meta.version),{credentials:'same-origin',headers:{Range:`bytes=${first}-${last}`,Accept:'application/octet-stream'},signal:partController.signal});
+      if([401,403].includes(res.status))throw failure('Sign in again, then return to resume.',true);
+      if([409,410,416].includes(res.status))throw failure('This shared file changed. Return to dshare to download the current file.',true);
+      if(res.status===429){wait=Math.max(wait,Number(res.headers.get('Retry-After')||2)*1000);attempt--;throw failure('Waiting for a transfer slot.');}
+      if(res.status!==206){if(res.status<500)throw failure('This file is no longer available.',true);throw failure('Connection interrupted.');}
+      if(res.headers.get('X-Dshare-Version')!==meta.version||res.headers.get('Content-Range')!==`bytes ${first}-${last}/${meta.size}`)throw failure('File changed during download.',true);
+      const data=await res.arrayBuffer();
+      if(data.byteLength!==last-first+1)throw failure('Incomplete chunk.');
+      return data;
+    }catch(error){
+      if(signal.aborted||error.fatal||attempt>=9)throw error;
+    }finally{clearTimeout(timer);signal.removeEventListener('abort',stop);}
+    await delay(wait,signal);
+  }
+}
+async function saveFile(){
+  if(running)return;
+  if(!window.showSaveFilePicker){window.location.href='/download/?raw=1';return;}
+  if(offset===meta.size){offset=0;handle=null;}
+  // Open the picker before network awaits, while the button has user activation.
+  try{if(!handle)handle=await window.showSaveFilePicker({suggestedName:meta.filename});}catch(error){if(error.name!=='AbortError')status.textContent='Could not open the save dialog.';return;}
+  running=true;paused=false;controller=new AbortController();start.disabled=true;pause.classList.remove('hidden');status.textContent='Downloading…';
+  let writer=null,pending=[],next=offset;const began=performance.now(),initial=offset;
+  try{
+    writer=await handle.createWritable({keepExistingData:offset>0});await writer.seek(offset);
+    while(offset<meta.size){
+      while(pending.length<meta.parallel&&next<meta.size){
+        const first=next,last=Math.min(meta.size-1,first+PART-1);next=last+1;
+        pending.push(fetchPart(first,last,controller.signal).then(data=>({data}),error=>({error})));
+      }
+      const result=await pending.shift();if(result.error)throw result.error;
+      if(controller.signal.aborted)throw new DOMException('Paused','AbortError');
+      await writer.write(result.data);offset+=result.data.byteLength;
+      progress.value=offset/meta.size*100;
+      const rate=(offset-initial)/Math.max(1,(performance.now()-began)/1000)/(1024*1024);
+      detail.textContent=progress.value.toFixed(1)+'% · '+rate.toFixed(1)+' MiB/s';
+    }
+    await writer.truncate(meta.size);await writer.close();writer=null;
+    status.textContent='Download complete.';start.textContent='Download again';
+  }catch(error){
+    controller.abort();await Promise.all(pending);
+    if(writer){try{await writer.truncate(offset);await writer.close();}catch(_){try{await writer.abort();}catch(_){}offset=initial;progress.value=offset/meta.size*100;}}
+    status.textContent=paused?'Paused. Your downloaded bytes are saved.':error.fatal?error.message:'Connection interrupted. Your downloaded bytes are saved; click Resume.';
+    start.textContent='Resume';
+  }finally{running=false;start.disabled=false;pause.classList.add('hidden');}
+}
+start.addEventListener('click',saveFile);
+pause.addEventListener('click',()=>{paused=true;controller?.abort();});
+window.addEventListener('beforeunload',event=>{if(running){event.preventDefault();event.returnValue='';}});
+if(!window.showSaveFilePicker){start.textContent='Browser download';document.getElementById('fallback').classList.remove('hidden');}
+</script></main></body></html>

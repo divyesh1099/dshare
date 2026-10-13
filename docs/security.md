@@ -75,3 +75,13 @@ block. Worker memory does not grow with total file size.
 Existing disk-based sessions and local development retain the old chunk path.
 Those unfinished chunks remain tied to local disk and may be lost on a deploy.
 Keep a single service replica for the public transfer gate and legacy sessions.
+
+Large browser downloads open a save-to-disk page. Chrome/Edge desktop fetch
+4 MiB authenticated byte ranges, keep at most four private/two public chunks
+in flight, and write in order to the File System Access API. This avoids
+Railway's per-request time cap without assembling the full file in browser
+memory. Pause closes and saves the confirmed prefix; Resume continues from
+that offset while the page remains open. Each request checks an opaque source
+version and fails if the shared file changes. Browsers without the save API
+retain native downloads and HTTP range resume. Direct API clients retain raw
+streaming; `?raw=1` also explicitly selects it.

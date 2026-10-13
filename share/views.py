@@ -1,3 +1,4 @@
+import hashlib
 import fcntl
 import uuid
 import json
@@ -698,9 +699,11 @@ def _private_file_response(field_file, request=None) -> HttpResponse:
     if request and request.headers.get("If-Range"):
         header = None
     size = None
+    total_size = None
     byte_range = None
     if header or head:
         size = field_file.size
+        total_size = size
         try:
             byte_range = _download_range(header, size)
         except ValueError:
@@ -763,7 +766,7 @@ def _private_file_response(field_file, request=None) -> HttpResponse:
         response["Content-Length"] = str(length)
     if byte_range:
         response.status_code = 206
-        response["Content-Range"] = f"bytes {byte_range[0]}-{byte_range[1]}/{field_file.size}"
+        response["Content-Range"] = f"bytes {byte_range[0]}-{byte_range[1]}/{total_size}"
     return response
 
 
@@ -1389,9 +1392,23 @@ def download_view(request: HttpRequest) -> HttpResponse:
     share = _get_or_create_public_share() if is_public else _get_or_create_user_share(request.user)
     _maybe_expire_share(share=share, ttl_seconds=ttl_seconds)
 
+    version = hashlib.sha256(f"{share.file.name if share.file else ''}|{share.updated_at.isoformat()}".encode()).hexdigest()
+    if request.GET.get("version") and request.GET["version"] != version:
+        return JsonResponse({"status": "fail", "code": "file_changed"}, status=409)
     if share.file:
-        # Never expose a reusable storage URL for private content.
-        return _private_file_response(share.file, request)
+        # Browser downloads use short authenticated ranges to avoid the edge's
+        # maximum request duration without buffering a 10 GiB file in JS.
+        if (request.method == "GET" and "text/html" in request.headers.get("Accept", "")
+                and not request.GET.get("raw") and not request.headers.get("Range")):
+            browser_size = share.file.size
+            if browser_size >= 64 * 1024 * 1024:
+                return render(request, "share/download.html", {"transfer": {
+                    "filename": os.path.basename(share.file.name), "size": browser_size,
+                    "version": version, "parallel": 4 if not is_public else 2,
+                    "mode": "Private" if not is_public else "Public"}})
+        response = _private_file_response(share.file, request)
+        response["X-Dshare-Version"] = version
+        return response
 
     if share.text:
         return HttpResponse(share.text, content_type="text/plain")

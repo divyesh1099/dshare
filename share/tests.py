@@ -779,3 +779,51 @@ class ProductionStorageConfigTests(TestCase):
             DJANGO_SETTINGS_MODULE="dshare.settings")
         result = subprocess.run([sys.executable, "-c", "import django; django.setup(); from django.core.files.storage import default_storage; from storages.backends.s3 import S3Storage; assert isinstance(default_storage, S3Storage); assert default_storage.bucket_name == 'test-bucket'; assert default_storage.config.s3['addressing_style'] == 'path'"], env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class BrowserLargeDownloadTests(TestCase):
+    def setUp(self):
+        import os
+        from pathlib import Path
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.override = override_settings(MEDIA_ROOT=self.tmp.name,
+            STORAGES={'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage', 'OPTIONS': {'location': self.tmp.name}},
+                'staticfiles': {'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage'}})
+        self.override.enable();self.addCleanup(self.override.disable)
+        self.name = 'uploads/public/large.bin'
+        path = Path(self.tmp.name) / self.name
+        path.parent.mkdir(parents=True)
+        with path.open('wb') as handle:
+            handle.truncate(64*1024*1024 + 1)
+        self.share = PublicShareState.objects.create(file=self.name)
+
+    def test_large_browser_download_page_and_raw_range(self):
+        response = self.client.get(reverse('download'), HTTP_ACCEPT='text/html')
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'Save file')
+        transfer = response.context['transfer']
+        self.assertEqual(transfer['size'], 64*1024*1024+1)
+        self.assertEqual(transfer['parallel'], 2)
+        part = self.client.get(reverse('download'), {'raw': '1', 'version': transfer['version']},
+            HTTP_RANGE='bytes=0-3', HTTP_ACCEPT='application/octet-stream')
+        self.assertEqual(part.status_code, 206)
+        self.assertEqual(part['X-Dshare-Version'], transfer['version'])
+        self.assertEqual(b''.join(part.streaming_content), b'\0'*4)
+        part.close()
+        raw = self.client.get(reverse('download'), {'raw': '1'}, HTTP_ACCEPT='text/html')
+        self.assertTrue(raw.streaming)
+        raw.close()
+        self.share.text = 'changed';self.share.file = None;self.share.save()
+        changed = self.client.get(reverse('download'), {'version': transfer['version']}, HTTP_RANGE='bytes=4-7')
+        self.assertEqual(changed.status_code, 409)
+
+    def test_private_download_page_is_protected_and_has_higher_concurrency(self):
+        user = User.objects.create_user(username='browser-private', password='pw')
+        UserProfile.objects.create(user=user, email_verified_at=timezone.now())
+        UserShareState.objects.create(user=user, file=self.name)
+        self.client.force_login(user)
+        response = self.client.get(reverse('download'), HTTP_ACCEPT='text/html')
+        self.assertEqual(response.context['transfer']['parallel'], 4)
+        self.assertEqual(response.context['transfer']['mode'], 'Private')
+        self.assertIn('no-store', response['Cache-Control'])
