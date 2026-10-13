@@ -91,5 +91,8 @@ class UploadSession(models.Model):
     total_chunks = models.PositiveIntegerField()
     received_chunks = models.JSONField(default=list, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
+    storage_upload_id = models.CharField(max_length=1024, blank=True)
+    storage_key = models.CharField(max_length=1024, blank=True)
+    part_etags = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

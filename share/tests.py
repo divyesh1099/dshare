@@ -553,3 +553,193 @@ class LargeTransferTests(ChunkedUploadTests):
         client.get_object.assert_called_once_with(Bucket="private", Key=field.name,
             Range=f"bytes={field.size-4}-{field.size-1}")
         field.open.assert_not_called()
+
+
+class MultipartTransferTests(TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.override = override_settings(MEDIA_ROOT=self.tmp.name,
+            DSHARE_TRANSFER_SLOT_DIR=self.tmp.name + '/slots', DSHARE_PUBLIC_TRANSFER_SLOTS=2,
+            STORAGES={'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
+                'staticfiles': {'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage'}})
+        self.override.enable()
+        self.addCleanup(self.override.disable)
+        self.storage = MagicMock()
+        self.storage.bucket_name = 'test'
+        self.storage._normalize_name.side_effect = lambda name: name
+        self.storage.get_available_name.side_effect = lambda name, max_length: name
+        self.sdk = self.storage.connection.meta.client
+        self.sdk.create_multipart_upload.return_value = {'UploadId': 'multipart-id'}
+        self.parts = {}
+        def upload_part(**kwargs):
+            self.parts[kwargs['PartNumber']] = kwargs['Body'].read()
+            return {'ETag': 'part-' + str(kwargs['PartNumber'])}
+        self.sdk.upload_part.side_effect = upload_part
+        for target in ('share.views.multipart_storage', 'share.transfers.multipart_storage'):
+            patcher = patch(target, return_value=self.storage)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.user = User.objects.create_user(username='multipart', password='pw')
+        UserProfile.objects.create(user=self.user, email_verified_at=timezone.now())
+
+    def start(self, size):
+        return self.client.post(reverse('api_upload_start'),
+            data=json.dumps({'filename': 'file.bin', 'size': size, 'chunk_size': 8*1024*1024}),
+            content_type='application/json')
+
+    def test_private_10_gib_limit_and_public_limit(self):
+        self.client.force_login(self.user)
+        response = self.start(10*1024**3)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['total_chunks'], 1280)
+        self.assertEqual(response.json()['parallel_chunks'], 6)
+        self.assertEqual(self.start(10*1024**3 + 1).status_code, 413)
+        self.client.logout()
+        self.assertEqual(self.start(700*1024**2).status_code, 200)
+        self.assertEqual(self.start(1024**3 + 1).status_code, 413)
+
+    def test_multipart_public_private_resume_complete_without_disk_staging(self):
+        import os
+        from unittest.mock import patch
+        from .models import UploadSession
+        from .views import _upload_session_dir
+        for private in (False, True):
+            if private:
+                self.client.force_login(self.user)
+            content = b'a' * (8*1024*1024) + b'b' * 1024
+            start = self.start(len(content)).json()
+            session_id = start['upload_id']
+            for index, part in ((1, content[8*1024*1024:]), (0, content[:8*1024*1024])):
+                response = self.client.post(reverse('api_upload_chunk'), {
+                    'upload_id': session_id, 'index': index,
+                    'chunk': SimpleUploadedFile('file.bin', part)})
+                self.assertEqual(response.status_code, 200)
+            resume = self.client.post(reverse('api_upload_start'),
+                data=json.dumps({'filename': 'file.bin', 'size': len(content),
+                    'chunk_size': start['chunk_size'], 'upload_id': session_id}),
+                content_type='application/json').json()
+            self.assertEqual(resume['received_chunks'], [0, 1])
+            self.assertEqual(resume['upload_id'], session_id)
+            self.assertFalse(os.path.exists(_upload_session_dir(session_id)))
+            self.assertEqual(self.parts[1] + self.parts[2], content)
+            for _ in range(2):
+                response = self.client.post(reverse('api_upload_complete'),
+                    data=json.dumps({'upload_id': session_id}), content_type='application/json')
+                self.assertEqual(response.status_code, 200)
+            self.assertIsNotNone(UploadSession.objects.get(id=session_id).completed_at)
+            call = self.sdk.complete_multipart_upload.call_args.kwargs
+            self.assertEqual(call['MultipartUpload']['Parts'], [
+                {'PartNumber': 1, 'ETag': 'part-1'}, {'PartNumber': 2, 'ETag': 'part-2'}])
+            share = UserShareState.objects.get(user=self.user) if private else PublicShareState.objects.get(pk=1)
+            self.assertIn(session_id, share.file.name)
+            self.assertFalse(os.path.exists(_upload_session_dir(session_id)))
+
+    def test_completion_recovers_after_storage_commit_and_response_loss(self):
+        from botocore.exceptions import ClientError
+        from .models import UploadSession
+        from .transfers import finish_multipart
+        session = UploadSession.objects.create(user=self.user, is_public=False,
+            filename='file.bin', total_size=7, chunk_size=8*1024*1024, total_chunks=1,
+            storage_upload_id='old-id', storage_key='unique/file.bin', part_etags={'0': 'etag'})
+        self.sdk.complete_multipart_upload.side_effect = ClientError({'Error': {'Code': 'NoSuchUpload'}}, 'CompleteMultipartUpload')
+        self.sdk.head_object.return_value = {'ContentLength': 7, 'Metadata': {'dshare-session': str(session.id)}}
+        share = UserShareState.objects.create(user=self.user)
+        response = finish_multipart(session, share)
+        self.assertEqual(response.status_code, 200)
+        session.refresh_from_db()
+        self.assertIsNotNone(session.completed_at)
+
+    def test_public_slots_are_shared_and_private_bypasses_saturation(self):
+        from django.test import RequestFactory
+        from django.http import StreamingHttpResponse
+        from django.contrib.auth.models import AnonymousUser
+        from .transfers import transfer_priority
+        factory = RequestFactory()
+        @transfer_priority
+        def view(request):
+            return StreamingHttpResponse(iter([b'x']))
+        request = factory.get('/download/')
+        request.user = AnonymousUser()
+        first, second = view(request), view(request)
+        try:
+            busy = view(request)
+            self.assertEqual(busy.status_code, 429)
+            self.assertEqual(busy['Retry-After'], '2')
+            request.user = self.user
+            private = view(request)
+            self.assertEqual(private.status_code, 200)
+            private.close()
+        finally:
+            first.close()
+            second.close()
+        request.user = AnonymousUser()
+        available = view(request)
+        self.assertEqual(available.status_code, 200)
+        available.close()
+
+    def test_parallel_download_preserves_order_with_bounded_reads(self):
+        import io, time
+        from .transfers import parallel_object_chunks
+        data = b'a'*(2*1024*1024) + b'b'*(2*1024*1024) + b'c'*123
+        def get_object(**kwargs):
+            first, last = map(int, kwargs['Range'][6:].split('-'))
+            if first == 0:
+                time.sleep(.02)  # Later ranges complete first.
+            self.assertEqual(kwargs['IfMatch'], 'immutable-etag')
+            return {'Body': io.BytesIO(data[first:last+1])}
+        self.sdk.get_object.side_effect = get_object
+        chunks = list(parallel_object_chunks(self.sdk, 'test', 'key', 0, len(data), 'immutable-etag', 3, part_size=2*1024*1024))
+        self.assertEqual(b''.join(chunks), data)
+        self.assertTrue(all(len(chunk) <= 1024*1024 for chunk in chunks))
+        self.assertEqual(self.sdk.get_object.call_count, 3)
+
+    def test_failed_completion_preserves_existing_share_and_receipts(self):
+        from botocore.exceptions import ClientError
+        from .models import UploadSession
+        self.client.force_login(self.user)
+        share = UserShareState.objects.create(user=self.user, file='uploads/user/previous.bin')
+        session = UploadSession.objects.create(user=self.user, is_public=False,
+            filename='file.bin', total_size=7, chunk_size=8*1024*1024, total_chunks=1,
+            storage_upload_id='id', storage_key='unique/file.bin', part_etags={'0': 'etag'})
+        self.sdk.complete_multipart_upload.side_effect = ClientError({'Error': {'Code': 'InternalError'}}, 'CompleteMultipartUpload')
+        response = self.client.post(reverse('api_upload_complete'),
+            data=json.dumps({'upload_id': str(session.id)}), content_type='application/json')
+        self.assertEqual(response.status_code, 503)
+        share.refresh_from_db()
+        session.refresh_from_db()
+        self.assertEqual(share.file.name, 'uploads/user/previous.bin')
+        self.assertIsNone(session.completed_at)
+        self.assertEqual(session.part_etags, {'0': 'etag'})
+
+    def test_large_s3_download_route_uses_parallel_ranges_and_preserves_bytes(self):
+        import io, hashlib
+        from django.test import RequestFactory
+        from .views import _private_file_response
+        field = MagicMock()
+        field.name = 'uploads/user/large.bin'
+        field.storage = self.storage
+        field.size = 64*1024*1024
+        first_body = MagicMock()
+        def get_object(**kwargs):
+            if 'Range' not in kwargs:
+                return {'Body': first_body, 'ContentLength': field.size, 'ETag': 'fixed'}
+            start, end = map(int, kwargs['Range'][6:].split('-'))
+            return {'Body': io.BytesIO(b'x'*(end-start+1))}
+        self.sdk.get_object.side_effect = get_object
+        request = RequestFactory().get('/download/')
+        request.user = self.user
+        response = _private_file_response(field, request)
+        digest = hashlib.sha256()
+        size = 0
+        for chunk in response.streaming_content:
+            self.assertLessEqual(len(chunk), 1024*1024)
+            size += len(chunk)
+            digest.update(chunk)
+        response.close()
+        self.assertEqual(size, field.size)
+        self.assertEqual(digest.digest(), hashlib.sha256(b'x'*field.size).digest())
+        first_body.read.assert_not_called()
+        field.open.assert_not_called()
+        self.assertEqual(self.sdk.get_object.call_count, 17)

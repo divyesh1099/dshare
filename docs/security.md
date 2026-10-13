@@ -47,16 +47,31 @@ in bounded chunks, so large files consume application bandwidth and worker time
 without being buffered in full in worker memory.
 Anonymous public sharing is still available and is separate from private accounts.
 
-## Large transfers
+## Large transfers and private preference
 
-Run Gunicorn with `gunicorn.conf.py` (also discovered automatically from the
-repository root). Threaded workers keep heartbeating during long transfers;
-Railway's start command must not select synchronous workers. Public and private
-downloads support HEAD and single byte ranges for resume, stream at most 1 MiB
-per read, and still authorize every request without exposing storage URLs.
-Large web uploads use 8 MiB resumable chunks and never fall back to a whole-file
-POST. Completion retries retain a receipt for the upload-session TTL; concurrent
-completion requests are serialized across workers. Replacement files get unique
-keys and the previous file is deleted only after the new file is saved.
-Chunk sessions currently use local disk: keep one service replica. A restart or
-deployment can discard unfinished chunks; select the file again to restart.
+Production limits are 10 GiB per private file and 1 GiB per public file.
+Run Gunicorn with `gunicorn.conf.py`; two threaded workers each have eight
+threads. A service-wide gate permits four public transfers at once across
+workers, reserving the remaining worker capacity for verified private users.
+Private uploads use six parallel chunks; public uploads use four. Public callers
+receive Retry-After when slots are busy; browser uploads back off automatically
+and browser downloads retry from a small waiting page. This reserves server
+capacity; it does not guarantee priority on the user's ISP or storage network.
+
+Object-storage uploads write each 8 MiB chunk as an S3 multipart part. Completion
+commits an ordered part list, eliminating whole-file local staging and the
+second full-file upload. Part receipts are persisted with DB row locking and
+resume across worker restarts/deployments. Completion retries recover even if
+storage committed before a response or DB failure. Expired incomplete uploads
+are aborted during session cleanup. Keys are unique, filenames use the FileField
+length limit, and the previous file is deleted only after replacement is saved.
+
+Public and private downloads authorize every request, support HEAD and single
+byte ranges, and never expose storage URLs. Large object downloads prefetch a
+bounded window of 4 MiB storage ranges (three for private, two for public), pin
+the original ETag with If-Match, preserve byte order, and emit at most 1 MiB per
+block. Worker memory does not grow with total file size.
+
+Existing disk-based sessions and local development retain the old chunk path.
+Those unfinished chunks remain tied to local disk and may be lost on a deploy.
+Keep a single service replica for the public transfer gate and legacy sessions.

@@ -67,6 +67,9 @@ from .models import (
 )
 
 User = get_user_model()
+from .transfers import (multipart_storage, begin_multipart, store_multipart_chunk,
+                        finish_multipart, abort_expired_multipart, transfer_priority, parallel_object_chunks)
+
 logger = logging.getLogger(__name__)
 
 
@@ -708,6 +711,7 @@ def _private_file_response(field_file, request=None) -> HttpResponse:
 
     content_type = "application/octet-stream"
     body = None
+    prefetch = None
     if is_s3 and not head:
         client = storage.connection.meta.client
         params = {"Bucket": storage.bucket_name, "Key": field_file.name}
@@ -717,6 +721,11 @@ def _private_file_response(field_file, request=None) -> HttpResponse:
         body = result["Body"]
         size = result.get("ContentLength")
         content_type = result.get("ContentType") or content_type
+        if size is not None and size >= 64 * 1024 * 1024 and result.get("ETag"):
+            body.close()
+            private = request is not None and request.user.is_authenticated
+            prefetch = parallel_object_chunks(client, storage.bucket_name, field_file.name,
+                byte_range[0] if byte_range else 0, size, result["ETag"], 3 if private else 2)
     elif not head:
         body = field_file.open("rb")
         size = field_file.size
@@ -730,6 +739,9 @@ def _private_file_response(field_file, request=None) -> HttpResponse:
         def chunks():
             remaining = length
             try:
+                if prefetch is not None:
+                    yield from prefetch
+                    return
                 while remaining is None or remaining > 0:
                     data = body.read(min(1024 * 1024, remaining) if remaining is not None else 1024 * 1024)
                     if not data:
@@ -738,6 +750,8 @@ def _private_file_response(field_file, request=None) -> HttpResponse:
                     if remaining is not None:
                         remaining -= len(data)
             finally:
+                if prefetch is not None:
+                    prefetch.close()
                 body.close()
 
         response = StreamingHttpResponse(chunks(), content_type=content_type)
@@ -915,12 +929,17 @@ def _cleanup_expired_upload_sessions() -> None:
     cutoff = timezone.now() - timezone.timedelta(seconds=ttl_seconds)
     expired = UploadSession.objects.filter(updated_at__lt=cutoff)
     for session in expired:
+        try:
+            abort_expired_multipart(session)
+        except Exception:
+            logger.exception("Failed to abort expired multipart upload")
+            continue
         _delete_upload_session_files(session)
         try:
             os.remove(os.path.join(_upload_chunk_root(), str(session.id) + ".lock"))
         except FileNotFoundError:
             pass
-    expired.delete()
+        session.delete()
 
 
 @require_POST
@@ -945,6 +964,10 @@ def api_upload_start(request: HttpRequest) -> JsonResponse:
     if not filename or total_size <= 0:
         return JsonResponse({"status": "fail"}, status=400)
 
+    storage = multipart_storage()
+    if storage is not None:
+        min_chunk_size = max(min_chunk_size, 5 * 1024 * 1024)
+        max_chunk_size = max(max_chunk_size, min_chunk_size)
     chunk_size = max(min_chunk_size, min(chunk_size, max_chunk_size))
 
     max_bytes = int(
@@ -995,6 +1018,19 @@ def api_upload_start(request: HttpRequest) -> JsonResponse:
             received_chunks=[],
         )
 
+    if storage is not None and not session.storage_upload_id and not os.path.exists(_upload_session_dir(str(session.id))):
+        share = _get_or_create_public_share() if is_public else _get_or_create_user_share(request.user)
+        try:
+            begin_multipart(session, share)
+        except Exception:
+            logger.exception("Failed to begin storage upload")
+            return JsonResponse({"status": "fail", "code": "storage_unavailable"}, status=503)
+    if session.storage_upload_id:
+        return JsonResponse({"status": "ok", "upload_id": str(session.id),
+            "chunk_size": session.chunk_size, "total_chunks": session.total_chunks,
+            "received_chunks": sorted(int(i) for i in session.part_etags),
+            "parallel_chunks": 6 if not is_public else 4, "storage_multipart": True})
+
     session_dir = _upload_session_dir(str(session.id))
     os.makedirs(session_dir, exist_ok=True)
 
@@ -1027,12 +1063,14 @@ def api_upload_start(request: HttpRequest) -> JsonResponse:
             "chunk_size": session.chunk_size,
             "total_chunks": session.total_chunks,
             "received_chunks": session.received_chunks,
+            "parallel_chunks": 6 if not is_public else 4,
         }
     )
 
 
 @require_POST
 @_private_access
+@transfer_priority
 def api_upload_chunk(request: HttpRequest) -> JsonResponse:
     upload_id = (request.POST.get("upload_id") or "").strip()
     index_raw = request.POST.get("index")
@@ -1075,6 +1113,14 @@ def api_upload_chunk(request: HttpRequest) -> JsonResponse:
     actual_size = _file_size(uploaded_file)
     if actual_size != expected_size:
         return JsonResponse({"status": "fail"}, status=400)
+
+    if session.storage_upload_id:
+        try:
+            store_multipart_chunk(session, index, uploaded_file)
+        except Exception:
+            logger.exception("Failed to store multipart chunk")
+            return JsonResponse({"status": "fail", "code": "storage_unavailable"}, status=503)
+        return JsonResponse({"status": "ok", "index": index})
 
     session_id = str(session.id)
     session_dir = _upload_session_dir(session_id)
@@ -1132,6 +1178,7 @@ def _serialize_upload_completion(view):
 
 @require_POST
 @_private_access
+@transfer_priority
 @_serialize_upload_completion
 def api_upload_complete(request: HttpRequest) -> JsonResponse:
     data = _parse_json(request)
@@ -1155,6 +1202,14 @@ def api_upload_complete(request: HttpRequest) -> JsonResponse:
 
     if session.completed_at:
         return JsonResponse({"status": "ok"})
+
+    if session.storage_upload_id:
+        share = _get_or_create_public_share() if is_public else _get_or_create_user_share(request.user)
+        try:
+            return finish_multipart(session, share)
+        except Exception:
+            logger.exception("Failed to complete multipart upload")
+            return JsonResponse({"status": "fail", "code": "storage_unavailable"}, status=503)
 
     session_id = str(session.id)
     session_dir = _upload_session_dir(session_id)
@@ -1266,6 +1321,7 @@ def api_upload_complete(request: HttpRequest) -> JsonResponse:
 
 @require_POST
 @_private_access
+@transfer_priority
 def upload_view(request: HttpRequest) -> JsonResponse:
     is_public = not request.user.is_authenticated
     if is_public:
@@ -1320,6 +1376,7 @@ def upload_view(request: HttpRequest) -> JsonResponse:
 
 @require_http_methods(["GET", "HEAD"])
 @_private_access
+@transfer_priority
 def download_view(request: HttpRequest) -> HttpResponse:
     is_public = not request.user.is_authenticated
     ttl_seconds = int(

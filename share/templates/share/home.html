@@ -328,7 +328,7 @@
       }
 
       const CHUNK_SIZE = 8 * 1024 * 1024;
-      const MAX_PARALLEL_CHUNKS = 4;
+      const MAX_PARALLEL_CHUNKS = 6;
       const uploadToggle = document.getElementById("upload-toggle");
       let uploadPaused = false;
       let uploadInProgress = false;
@@ -382,15 +382,15 @@
         });
       }
 
-      async function retry(action, attempts = 4, baseDelayMs = 400) {
+      async function retry(action, attempts = 7, baseDelayMs = 400) {
         let delayMs = baseDelayMs;
         for (let attempt = 0; attempt < attempts; attempt++) {
           try {
             return await action();
           } catch (_) {
             if (attempt === attempts - 1) throw _;
-            await new Promise((resolve) => setTimeout(resolve, delayMs));
-            delayMs *= 2;
+            await new Promise((resolve) => setTimeout(resolve, Math.max(delayMs, _.retryAfter || 0)));
+            delayMs = Math.min(delayMs * 2, 10000);
           }
         }
         throw new Error("retry failed");
@@ -1054,7 +1054,7 @@
         const payload = {
           filename: file.name,
           size: file.size,
-          chunk_size: CHUNK_SIZE,
+          chunk_size: (cached && cached.chunk_size) || CHUNK_SIZE,
           content_type: file.type || "",
         };
         if (cached && cached.upload_id) {
@@ -1108,7 +1108,9 @@
             body: formData,
           });
           if (!res.ok) {
-            throw new Error("chunk upload failed");
+            const error = new Error("chunk upload failed");
+            error.retryAfter = Number(res.headers.get("Retry-After") || 0) * 1000;
+            throw error;
           }
           return chunk.size;
         }
@@ -1118,7 +1120,7 @@
           if (!received.has(index)) missing.push(index);
         }
 
-        let concurrency = Math.floor((navigator.hardwareConcurrency || 4) / 2);
+        let concurrency = session.parallel_chunks || 2;
         concurrency = Math.max(1, Math.min(MAX_PARALLEL_CHUNKS, concurrency));
         concurrency = Math.min(concurrency, missing.length || 1);
 
